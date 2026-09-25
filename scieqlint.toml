@@ -1,0 +1,72 @@
+[project]
+root = "."
+order = []
+
+[scanner]
+markdown = true
+inline_math = false
+math_fences = true
+
+[parser]
+strict_unknowns = false
+unknown_identifier_policy = "single_symbol"
+
+[checks.algebra]
+enabled = true
+unknown = "info"
+denominator_warnings = true
+
+[checks.references]
+enabled = true
+missing = "warn"
+duplicate_labels = "error"
+missing_label_strict = false
+
+[checks.dimension]
+mode = "auto"
+unknown_variables = "warn"
+
+[checks.symbols]
+enabled = false
+
+[baseline]
+files = []
+
+[vars]
+# m = "M"
+# v = "L T^-1"
+# theta = "1"
+
+[aliases]
+# theta = ["\\theta", "θ"]
+
+[limits]
+max_file_bytes = 1048576
+max_math_blocks_per_file = 2000
+max_expression_nodes = 2000
+algebra_max_ops = 2000
+algebra_timeout_ms = 250
+max_reported_diagnostics_per_file = 200
+
+[report]
+absolute_paths = false
+color = "auto"
+
+[severity]
+# PARSE020 = "ignore"
+
+[ignore]
+files = [
+  "build/**",
+  "dist/**",
+  ".venv/**",
+  "GOOD_FIRST_ISSUES.md",
+  "README.md",
+  "SPEC.md",
+  "docs/diagnostics.md",
+  "docs/index.md",
+  "docs/limitations.md",
+  "examples/bad/**",
+  "src/scieqlint/examples/bad/**",
+  "tests/fixtures/**",
+]

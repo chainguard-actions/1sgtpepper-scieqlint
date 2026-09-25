@@ -1,0 +1,20 @@
+name: Test version args - scieqlint --version
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: action
+        uses: .
+        with:
+          python-version: "3.11"
+          package-version: "1.1.0"
+          args: "--version"
+
+      - name: Assert action succeeded with --version flag
+        run: |
+          echo "PASS: scieqlint --version ran successfully"

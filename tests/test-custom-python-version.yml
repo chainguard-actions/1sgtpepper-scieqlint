@@ -1,0 +1,64 @@
+name: Test custom Python version
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Create test directory with valid markdown
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/test-py312-docs"
+          cat > "$GITHUB_WORKSPACE/test-py312-docs/valid.md" << 'EOF'
+          # Valid equations
+
+          $$
+          E = m * c^2
+          $$
+          EOF
+
+      - name: Create scieqlint config for custom python version test
+        run: |
+          cat > "$GITHUB_WORKSPACE/scieqlint-py312-test.toml" << 'EOF'
+          [project]
+          root = "."
+          order = []
+
+          [scanner]
+          markdown = true
+          inline_math = false
+          math_fences = true
+
+          [parser]
+          strict_unknowns = false
+          unknown_identifier_policy = "single_symbol"
+
+          [checks.algebra]
+          enabled = false
+
+          [checks.references]
+          enabled = true
+          missing = "warn"
+          duplicate_labels = "error"
+          missing_label_strict = false
+
+          [checks.dimension]
+          mode = "auto"
+          unknown_variables = "warn"
+
+          [checks.symbols]
+          enabled = false
+          EOF
+
+      - id: action
+        uses: .
+        with:
+          python-version: "3.12"
+          package-version: "1.1.0"
+          args: "check test-py312-docs --config scieqlint-py312-test.toml"
+
+      - name: Assert action succeeded with Python 3.12
+        run: |
+          echo "PASS: scieqlint ran successfully with Python 3.12"
