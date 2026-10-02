@@ -10,30 +10,33 @@
 
 **Harden Agent Version:** `2`
 
-Action **1sgtpepper--scieqlint/v1.1.0** was hardened automatically. 4 finding(s) were identified and resolved across 1 iteration(s).
+Action **1sgtpepper--scieqlint/v1.1.0** was hardened automatically. 5 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### unpinned-uses (severity: high)
 
-action.yml uses `actions/setup-python@v6`, which is a mutable tag reference rather than a pinned 40-character commit SHA. A tag can be moved to point to a different (potentially malicious) commit, enabling supply-chain attacks.
+The action uses `actions/setup-python@v6` with a mutable tag ref (`@v6`) instead of a pinned 40-character commit SHA. This is vulnerable to supply-chain attacks if the tag is moved to point to a different (potentially malicious) commit.
 
 Locations:
 
-- `action.yml:15`
+- `action.yml:22`
 
 ### script-injection (severity: high)
 
-Two `run:` steps in action.yml directly interpolate GitHub Actions expressions into shell command strings, violating rule (a):
-
-1. Line 19: `run: python -m pip install "scieqlint==${{ inputs.package-version }}"` — the `inputs.package-version` value is injected directly into the shell command. An attacker-controlled value could break out of the quoted string and execute arbitrary commands.
-
-2. Line 22: `run: scieqlint ${{ inputs.args }}` — the `inputs.args` value is injected directly and unquoted into the shell command. An attacker can supply shell metacharacters (`;`, `|`, `&`, `$(...)`, etc.) to execute arbitrary commands.
+Sub-rule (a): `${{ inputs.package-version }}` is interpolated directly inside a `run:` shell command: `python -m pip install "scieqlint==${{ inputs.package-version }}"`. An attacker-controlled input value can break out of the quoted string and inject arbitrary shell commands. The value should be passed via an `env:` variable and then double-quoted in the shell script.
 
 Locations:
 
-- `action.yml:19`
-- `action.yml:22`
+- `action.yml:27`
+
+### script-injection (severity: high)
+
+Sub-rule (a): `${{ inputs.args }}` is interpolated directly inside a `run:` shell command: `scieqlint ${{ inputs.args }}`. An attacker-controlled input value can inject arbitrary shell commands. The value should be passed via an `env:` variable and then double-quoted in the shell script.
+
+Locations:
+
+- `action.yml:30`
 
 ### static-inline-injection (severity: high)
 
@@ -59,8 +62,8 @@ Locations:
 
 **Notes:**
 
-Fixed all four findings in hardened/action/action.yml:
-1. Pinned `actions/setup-python@v6` to full commit SHA `ece7cb06caefa5fff74198d8649806c4678c61a1` with `# v6` comment.
-2. Moved `${{ inputs.package-version }}` to an `env:` block as `PACKAGE_VERSION` and referenced it as `$PACKAGE_VERSION` in the pip install command.
-3. Moved `${{ inputs.args }}` to an `env:` block as `INPUT_ARGS`, then used the xargs-based tokenization idiom to split it into a bash array (preserving quoted sub-arguments) before passing to `scieqlint`. This prevents shell injection while correctly handling multi-word argument lists like the default `check .`.
+Fixed all findings in action.yml:
+1. Pinned `actions/setup-python@v6` to full commit SHA `ece7cb06caefa5fff74198d8649806c4678c61a1` with `# v6` comment for readability.
+2. Moved `${{ inputs.package-version }}` into an `env:` block as `PACKAGE_VERSION` and referenced it as `$PACKAGE_VERSION` in the shell command.
+3. Moved `${{ inputs.args }}` into an `env:` block as `INPUT_ARGS`, then used xargs-based tokenization into a bash array (`args=()`) to properly split the argument list while preserving quoting and preventing shell injection.
 
