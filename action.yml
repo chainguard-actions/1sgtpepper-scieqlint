@@ -40,8 +40,8 @@ runs:
     - name: Install SciEqLint
       shell: bash
       env:
-        PACKAGE_VERSION: ${{ inputs.package-version }}
-      run: python -m pip install "scieqlint==$PACKAGE_VERSION"
+        PKG_VER: ${{ inputs.package-version }}
+      run: python -m pip install "scieqlint==$PKG_VER"
     - name: Run SciEqLint
       shell: bash
       env:
