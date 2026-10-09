@@ -1,77 +1,28 @@
 name: Test error detection - invalid equations
 on:
   workflow_dispatch:
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Create test directory with invalid markdown (bad equation)
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/test-bad-docs"
-          # This equation is algebraically wrong: (a+b)^2 != a^2 + b^2
-          cat > "$GITHUB_WORKSPACE/test-bad-docs/bad.md" << 'EOF'
-          # Bad equation
-
-          $$
-          (a+b)^2 = a^2 + b^2
-          $$
-          EOF
-
-      - name: Create scieqlint config for error detection test
-        run: |
-          cat > "$GITHUB_WORKSPACE/scieqlint-bad-test.toml" << 'EOF'
-          [project]
-          root = "."
-          order = []
-
-          [scanner]
-          markdown = true
-          inline_math = false
-          math_fences = true
-
-          [parser]
-          strict_unknowns = false
-          unknown_identifier_policy = "single_symbol"
-
-          [checks.algebra]
-          enabled = true
-          unknown = "info"
-          denominator_warnings = true
-
-          [checks.references]
-          enabled = true
-          missing = "warn"
-          duplicate_labels = "error"
-          missing_label_strict = false
-
-          [checks.dimension]
-          mode = "auto"
-          unknown_variables = "warn"
-
-          [checks.symbols]
-          enabled = false
-          EOF
-
-      - id: action
+      - name: Run SciEqLint on invalid equations
+        id: action
         uses: .
         continue-on-error: true
         with:
           python-version: "3.11"
           package-version: "1.1.0"
-          args: "check test-bad-docs --config scieqlint-bad-test.toml"
-
-      - name: Assert action failed on bad equation
+          args: "check ${{ github.workspace }}/tests/fixtures/invalid/algebra_invalid.md"
+      - name: Assert action detected errors
         env:
           OUTCOME: ${{ steps.action.outcome }}
         run: |
           echo "outcome: $OUTCOME"
           if [ "$OUTCOME" = "failure" ]; then
-            echo "PASS: scieqlint correctly detected the bad equation and failed"
+            echo "PASS: scieqlint correctly detected invalid equations and exited non-zero"
           elif [ "$OUTCOME" = "success" ]; then
-            echo "FAIL: scieqlint should have failed on the bad equation but succeeded"
+            echo "FAIL: scieqlint should have failed on invalid equations but succeeded"
             exit 1
           else
             echo "FAIL: unexpected outcome '$OUTCOME'"
