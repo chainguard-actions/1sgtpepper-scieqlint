@@ -1,0 +1,30 @@
+name: Test check on a clean file
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          # The default 1.2.1 is not published on PyPI; use the latest published release.
+          package-version: "1.1.0"
+          args: check tests/fixtures/good/algebra_good.md
+      - name: Assert action succeeded and correct version installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          VERSION="$(python -m pip show scieqlint | awk '/^Version:/{print $2}')"
+          echo "installed version: $VERSION"
+          if [ "$VERSION" != "1.1.0" ]; then
+            echo "FAIL: expected scieqlint 1.1.0"
+            exit 1
+          fi
+          echo "PASS"

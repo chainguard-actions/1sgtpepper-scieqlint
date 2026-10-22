@@ -1,0 +1,55 @@
+[project]
+root = "."
+order = []
+
+[scanner]
+markdown = true
+inline_math = false
+math_fences = true
+
+[parser]
+strict_unknowns = false
+
+[checks.algebra]
+enabled = true
+
+[checks.references]
+enabled = true
+missing_label_strict = false
+
+[checks.dimension]
+mode = "auto"
+unknown_variables = "warn"
+
+[checks.symbols]
+enabled = false
+
+[baseline]
+files = []
+
+[vars]
+# m = "M"
+# v = "L T^-1"
+# theta = "1"
+
+[aliases]
+# theta = ["\\theta", "θ"]
+
+[report]
+show_suppressed = false
+
+[ignore]
+files = [
+  "build/**",
+  "dist/**",
+  ".venv/**",
+  "GOOD_FIRST_ISSUES.md",
+  "README.md",
+  "SPEC.md",
+  "docs/diagnostics.md",
+  "docs/index.md",
+  "docs/limitations.md",
+  "examples/bad/**",
+  "src/scieqlint/examples/bad/**",
+  "tests/fixtures/**",
+]

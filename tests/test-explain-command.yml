@@ -1,0 +1,37 @@
+name: Test custom args and python-version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        with:
+          python-version: "3.12"
+          # The default 1.2.1 is not published on PyPI; use the latest published release.
+          package-version: "1.1.0"
+          args: --help
+      - name: Assert custom args ran on requested Python
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "FAIL: expected success"
+            exit 1
+          fi
+          PYV="$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
+          echo "python: $PYV"
+          if [ "$PYV" != "3.12" ]; then
+            echo "FAIL: expected Python 3.12"
+            exit 1
+          fi
+          OUT="$(scieqlint --help 2>&1)"
+          echo "$OUT"
+          if ! echo "$OUT" | grep -q "check"; then
+            echo "FAIL: expected 'check' subcommand in help output"
+            exit 1
+          fi
+          echo "PASS"

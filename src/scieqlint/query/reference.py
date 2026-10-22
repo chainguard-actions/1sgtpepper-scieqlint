@@ -1,0 +1,499 @@
+"""Reference QueryView."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import TypeVar, cast
+
+from scieqlint.facts.reference import (
+    CrossrefMetadataFact,
+    EquationLabelFact,
+    EquationRefFact,
+    GenericRefFact,
+    NormalizedReferenceTarget,
+    ReferenceDisplayTextFact,
+    TargetAnchorFact,
+    crossref_target_identity,
+    generic_reference_identity,
+    normalized_reference_target,
+)
+from scieqlint.facts.snapshot import FactSnapshot
+from scieqlint.facts.structure import CodeCellFact
+from scieqlint.io.workspace import normalize_project_path
+
+TargetFact = TargetAnchorFact | EquationLabelFact | CodeCellFact
+TargetT = TypeVar("TargetT", bound=TargetFact)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTarget:
+    key: str
+    facts: tuple[TargetFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class NonvisibleEquationTargetImpact:
+    reference: EquationRefFact
+    visible_targets: tuple[EquationLabelFact, ...]
+    hidden_targets: tuple[EquationLabelFact, ...]
+    excluded_targets: tuple[EquationLabelFact, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnclearReferenceDisplayText:
+    fact: ReferenceDisplayTextFact
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceQueryView:
+    snapshot: FactSnapshot
+
+    def generic_targets(self) -> tuple[TargetAnchorFact, ...]:
+        return self.snapshot.target_anchors
+
+    def equation_targets(self) -> tuple[EquationLabelFact, ...]:
+        return self.snapshot.equation_labels
+
+    def code_cell_targets(self) -> tuple[CodeCellFact, ...]:
+        return tuple(cell for cell in self.snapshot.code_cells if cell.normalized_label is not None)
+
+    def visible_code_cell_targets(self) -> tuple[CodeCellFact, ...]:
+        return tuple(cell for cell in self.code_cell_targets() if cell.visibility == "visible")
+
+    def hidden_code_cell_targets(self) -> tuple[CodeCellFact, ...]:
+        return tuple(cell for cell in self.code_cell_targets() if cell.visibility == "hidden")
+
+    def excluded_code_cell_targets(self) -> tuple[CodeCellFact, ...]:
+        return tuple(cell for cell in self.code_cell_targets() if cell.visibility == "excluded")
+
+    def visible_equation_targets(self) -> tuple[EquationLabelFact, ...]:
+        return tuple(
+            label for label in self.snapshot.equation_labels if label.visibility == "visible"
+        )
+
+    def hidden_equation_targets(self) -> tuple[EquationLabelFact, ...]:
+        return tuple(
+            label for label in self.snapshot.equation_labels if label.visibility == "hidden"
+        )
+
+    def excluded_equation_targets(self) -> tuple[EquationLabelFact, ...]:
+        return tuple(
+            label for label in self.snapshot.equation_labels if label.visibility == "excluded"
+        )
+
+    def generic_refs(self) -> tuple[GenericRefFact, ...]:
+        return self.snapshot.generic_refs
+
+    def visible_generic_refs(self) -> tuple[GenericRefFact, ...]:
+        return tuple(ref for ref in self.snapshot.generic_refs if ref.visibility == "visible")
+
+    def equation_refs(self) -> tuple[EquationRefFact, ...]:
+        return self.snapshot.equation_refs
+
+    def visible_equation_refs(self) -> tuple[EquationRefFact, ...]:
+        return tuple(ref for ref in self.snapshot.equation_refs if ref.visibility == "visible")
+
+    def metadata_facts(self) -> tuple[CrossrefMetadataFact, ...]:
+        if not self.snapshot.project_members:
+            return self.snapshot.crossref_metadata
+        visible_document_ids = frozenset(
+            member.document_id
+            for member in self.snapshot.project_members
+            if member.visibility == "visible"
+        )
+        return tuple(
+            fact
+            for fact in self.snapshot.crossref_metadata
+            if fact.document_id in visible_document_ids
+        )
+
+    def display_text_facts(self) -> tuple[ReferenceDisplayTextFact, ...]:
+        if not self.snapshot.project_members:
+            return self.snapshot.reference_display_text
+        visible_document_ids = frozenset(
+            member.document_id
+            for member in self.snapshot.project_members
+            if member.visibility == "visible"
+        )
+        return tuple(
+            fact
+            for fact in self.snapshot.reference_display_text
+            if fact.document_id in visible_document_ids
+        )
+
+    def unclear_nonheading_display_text(
+        self,
+    ) -> tuple[UnclearReferenceDisplayText, ...]:
+        """Return resolved non-heading references with missing or generic labels."""
+
+        unclear: list[UnclearReferenceDisplayText] = []
+        for fact in sorted(self.display_text_facts(), key=_display_source_key):
+            if (
+                fact.target_type in {None, "heading"}
+                or fact.target_identity is None
+                or fact.display_intent == "typed-number"
+            ):
+                continue
+            reason = _unclear_display_reason(fact)
+            if reason is not None:
+                unclear.append(UnclearReferenceDisplayText(fact=fact, reason=reason))
+        return tuple(unclear)
+
+    def conflicting_metadata(
+        self,
+    ) -> tuple[tuple[NormalizedReferenceTarget, tuple[CrossrefMetadataFact, ...]], ...]:
+        """Return targets with distinct metadata signatures across output boundaries."""
+
+        by_target: dict[NormalizedReferenceTarget, list[CrossrefMetadataFact]] = defaultdict(list)
+        for fact in self.metadata_facts():
+            if fact.metadata_kind != "target-definition":
+                continue
+            identity = crossref_target_identity(fact)
+            if identity is None:
+                continue
+            by_target[identity].append(fact)
+        conflicts: list[tuple[NormalizedReferenceTarget, tuple[CrossrefMetadataFact, ...]]] = []
+        for target, facts in sorted(
+            by_target.items(), key=lambda item: (item[0][0].as_posix(), item[0][1])
+        ):
+            boundaries = {fact.output_boundary for fact in facts}
+            signatures = {_producer_signature(fact) for fact in facts}
+            if len(boundaries) > 1 and len(signatures) > 1:
+                conflicts.append((target, tuple(sorted(facts, key=_metadata_source_key))))
+        return tuple(conflicts)
+
+    def target_index(self) -> dict[str, tuple[TargetFact, ...]]:
+        """Return the label-only namespace used by pathless reference roles."""
+
+        label_index, _ = self._target_indexes(self._target_facts())
+        return label_index
+
+    def target_identity_index(
+        self,
+    ) -> dict[NormalizedReferenceTarget, tuple[TargetFact, ...]]:
+        """Return targets keyed by normalized member path and label."""
+
+        _, identity_index = self._target_indexes(self._target_facts())
+        return identity_index
+
+    def equation_target_index(self) -> dict[str, tuple[EquationLabelFact, ...]]:
+        return _equation_index(self.visible_equation_targets())
+
+    def hidden_equation_target_index(self) -> dict[str, tuple[EquationLabelFact, ...]]:
+        return _equation_index(self.hidden_equation_targets())
+
+    def excluded_equation_target_index(
+        self,
+    ) -> dict[str, tuple[EquationLabelFact, ...]]:
+        return _equation_index(self.excluded_equation_targets())
+
+    def duplicate_equation_targets(
+        self,
+    ) -> dict[str, tuple[EquationLabelFact, ...]]:
+        return {key: value for key, value in self.equation_target_index().items() if len(value) > 1}
+
+    def unresolved_equation_refs(self) -> tuple[EquationRefFact, ...]:
+        targets = self.equation_target_index()
+        return tuple(
+            ref for ref in self.visible_equation_refs() if ref.normalized_target not in targets
+        )
+
+    def ambiguous_equation_refs(self) -> tuple[EquationRefFact, ...]:
+        targets = self.equation_target_index()
+        return tuple(
+            ref
+            for ref in self.visible_equation_refs()
+            if len(targets.get(ref.normalized_target, ())) > 1
+        )
+
+    def nonvisible_equation_target_impacts(
+        self,
+    ) -> tuple[NonvisibleEquationTargetImpact, ...]:
+        """Return references whose target identity exists outside the visible set."""
+
+        visible = self.equation_target_index()
+        hidden = {
+            target: tuple(sorted(labels, key=_equation_label_source_key))
+            for target, labels in self.hidden_equation_target_index().items()
+        }
+        excluded = {
+            target: tuple(sorted(labels, key=_equation_label_source_key))
+            for target, labels in self.excluded_equation_target_index().items()
+        }
+        impacts: list[NonvisibleEquationTargetImpact] = []
+        for ref in sorted(self.visible_equation_refs(), key=_reference_source_key):
+            hidden_targets = hidden.get(ref.normalized_target, ())
+            excluded_targets = excluded.get(ref.normalized_target, ())
+            if not hidden_targets and not excluded_targets:
+                continue
+            impacts.append(
+                NonvisibleEquationTargetImpact(
+                    reference=ref,
+                    visible_targets=visible.get(ref.normalized_target, ()),
+                    hidden_targets=hidden_targets,
+                    excluded_targets=excluded_targets,
+                )
+            )
+        return tuple(impacts)
+
+    def duplicate_generic_targets(
+        self,
+    ) -> dict[NormalizedReferenceTarget, tuple[TargetAnchorFact, ...]]:
+        _, index = self._target_indexes(
+            tuple(
+                anchor
+                for anchor in self.snapshot.target_anchors
+                if anchor.visibility == "visible" and anchor.placement != "orphaned"
+            )
+        )
+        return {key: tuple(value) for key, value in index.items() if len(value) > 1}
+
+    def duplicate_code_cell_targets(
+        self,
+    ) -> dict[NormalizedReferenceTarget, tuple[CodeCellFact, ...]]:
+        duplicates: dict[NormalizedReferenceTarget, tuple[CodeCellFact, ...]] = {}
+        for key, facts in self.target_identity_index().items():
+            if len(facts) < 2:
+                continue
+            cells = tuple(
+                sorted(
+                    (fact for fact in facts if isinstance(fact, CodeCellFact)),
+                    key=_code_cell_source_key,
+                )
+            )
+            if not cells:
+                continue
+            non_cell_count = len(facts) - len(cells)
+            offending = cells if non_cell_count else cells[1:]
+            duplicates[key] = offending
+        return duplicates
+
+    def unresolved_generic_refs(self) -> tuple[GenericRefFact, ...]:
+        targets, identity_targets = self._target_indexes(self._target_facts())
+        return tuple(
+            ref
+            for ref in self.visible_generic_refs()
+            if generic_reference_identity(ref) is not None
+            and not self._generic_ref_targets(ref, targets, identity_targets)
+        )
+
+    def ambiguous_generic_refs(self) -> tuple[GenericRefFact, ...]:
+        targets, identity_targets = self._target_indexes(self._target_facts())
+        return tuple(
+            ref
+            for ref in self.visible_generic_refs()
+            if generic_reference_identity(ref) is not None
+            and len(self._generic_ref_targets(ref, targets, identity_targets)) > 1
+        )
+
+    def path_normalization_mismatches(
+        self,
+    ) -> tuple[tuple[GenericRefFact, tuple[str, ...], tuple[str, ...]], ...]:
+        """Return local path references whose raw and normalized resolution differ."""
+
+        raw_members: dict[str, list[str]] = defaultdict(list)
+        normalized_members: dict[str, list[str]] = defaultdict(list)
+        for member in self.snapshot.project_members:
+            raw_members[member.path.as_posix()].append(member.document_id)
+            normalized = member.normalized_path or member.path
+            normalized_members[normalized.as_posix()].append(member.document_id)
+
+        raw_member_index = {path: tuple(document_ids) for path, document_ids in raw_members.items()}
+        normalized_member_index = {
+            path: tuple(document_ids) for path, document_ids in normalized_members.items()
+        }
+        normalized_member_ids = {
+            path: frozenset(document_ids) for path, document_ids in normalized_members.items()
+        }
+
+        mismatches: list[tuple[GenericRefFact, tuple[str, ...], tuple[str, ...]]] = []
+        target_facts = self._target_facts()
+        _, target_index = self._target_indexes(target_facts)
+        raw_target_index: dict[tuple[str, str], list[tuple[int, TargetFact]]] = defaultdict(list)
+        for order, fact in enumerate(target_facts):
+            normalized_label = cast(str, fact.normalized_label)
+            raw_target_index[(fact.document_id, normalized_label)].append((order, fact))
+        normalized_target_cache: dict[NormalizedReferenceTarget, tuple[TargetFact, ...]] = {}
+        mismatch_cache: dict[tuple[str, NormalizedReferenceTarget], bool] = {}
+        for ref in self.visible_generic_refs():
+            if ref.resolved_raw_target_path is None or ref.normalized_target_path is None:
+                continue
+            raw_matches = raw_member_index.get(ref.resolved_raw_target_path, ())
+            normalized_path = ref.normalized_target_path.as_posix()
+            normalized_matches = normalized_member_index.get(normalized_path, ())
+            identity = normalized_reference_target(ref)
+            normalized_targets = normalized_target_cache.get(identity)
+            if normalized_targets is None:
+                member_ids = normalized_member_ids.get(normalized_path, frozenset())
+                normalized_targets = tuple(
+                    fact
+                    for fact in target_index.get(identity, ())
+                    if fact.document_id in member_ids
+                )
+                normalized_target_cache[identity] = normalized_targets
+            resolution = (ref.resolved_raw_target_path, identity)
+            mismatch = mismatch_cache.get(resolution)
+            if mismatch is None:
+                raw_target_candidates = [
+                    candidate
+                    for document_id in dict.fromkeys(raw_matches)
+                    for candidate in raw_target_index.get((document_id, identity[1]), ())
+                ]
+                raw_target_candidates.sort(key=lambda candidate: candidate[0])
+                raw_targets = tuple(fact for _order, fact in raw_target_candidates)
+                mismatch = raw_targets != normalized_targets and bool(normalized_targets)
+                mismatch_cache[resolution] = mismatch
+            if mismatch:
+                mismatches.append((ref, raw_matches, normalized_matches))
+        return tuple(mismatches)
+
+    def _generic_ref_targets(
+        self,
+        ref: GenericRefFact,
+        target_index: dict[str, tuple[TargetFact, ...]],
+        identity_index: dict[NormalizedReferenceTarget, tuple[TargetFact, ...]],
+    ) -> tuple[TargetFact, ...]:
+        identity = generic_reference_identity(ref)
+        assert identity is not None
+        if isinstance(identity, tuple):
+            return identity_index.get(identity, ())
+        return target_index.get(identity, ())
+
+    def _target_facts(self) -> tuple[TargetFact, ...]:
+        return (
+            *tuple(
+                anchor
+                for anchor in self.snapshot.target_anchors
+                if anchor.visibility == "visible" and anchor.placement != "orphaned"
+            ),
+            *self.visible_equation_targets(),
+            *self.visible_code_cell_targets(),
+        )
+
+    def _target_indexes(
+        self,
+        targets: tuple[TargetT, ...],
+    ) -> tuple[
+        dict[str, tuple[TargetT, ...]],
+        dict[NormalizedReferenceTarget, tuple[TargetT, ...]],
+    ]:
+        member_paths = {
+            member.document_id: member.normalized_path or member.path
+            for member in self.snapshot.project_members
+        }
+        label_index: dict[str, list[TargetT]] = defaultdict(list)
+        identity_index: dict[NormalizedReferenceTarget, list[TargetT]] = defaultdict(list)
+        for target in targets:
+            normalized_label = cast(str, target.normalized_label)
+            label_index[normalized_label].append(target)
+            if target.document_id not in member_paths:
+                member_paths[target.document_id] = normalize_project_path(target.document_id)
+            identity = (member_paths[target.document_id], normalized_label)
+            identity_index[identity].append(target)
+        return (
+            {key: tuple(value) for key, value in label_index.items()},
+            {key: tuple(value) for key, value in identity_index.items()},
+        )
+
+    def orphaned_targets(self) -> tuple[TargetAnchorFact, ...]:
+        return tuple(
+            anchor for anchor in self.snapshot.target_anchors if anchor.placement == "orphaned"
+        )
+
+
+def _equation_index(
+    labels: tuple[EquationLabelFact, ...],
+) -> dict[str, tuple[EquationLabelFact, ...]]:
+    index: dict[str, list[EquationLabelFact]] = defaultdict(list)
+    for label in labels:
+        index[label.normalized_label].append(label)
+    return {key: tuple(value) for key, value in index.items()}
+
+
+def _equation_label_source_key(
+    fact: EquationLabelFact,
+) -> tuple[str, int, int, str]:
+    span = fact.label_span or fact.span
+    return (
+        fact.document_id,
+        span.start if span is not None else -1,
+        span.end if span is not None else -1,
+        fact.fact_id,
+    )
+
+
+def _reference_source_key(fact: EquationRefFact) -> tuple[str, int, int, str]:
+    span = fact.target_span or fact.span
+    return (
+        fact.document_id,
+        span.start if span is not None else -1,
+        span.end if span is not None else -1,
+        fact.fact_id,
+    )
+
+
+def _code_cell_source_key(fact: CodeCellFact) -> tuple[str, int, int, str]:
+    span = fact.label_span or fact.span
+    return (
+        fact.document_id,
+        span.start if span is not None else -1,
+        span.end if span is not None else -1,
+        fact.fact_id,
+    )
+
+
+def _metadata_source_key(fact: CrossrefMetadataFact) -> tuple[str, int, int, str, str]:
+    """Return a content-independent source order for conflict baselines."""
+
+    span = fact.target_span or fact.span
+    return (
+        fact.document_id,
+        span.start if span is not None else -1,
+        span.end if span is not None else -1,
+        fact.output_boundary,
+        fact.fact_id,
+    )
+
+
+def _producer_signature(
+    fact: CrossrefMetadataFact,
+) -> tuple[str | None, tuple[tuple[str, str], ...]]:
+    return (
+        fact.resolved_target_kind,
+        tuple(sorted(fact.target_metadata)),
+    )
+
+
+def _unclear_display_reason(fact: ReferenceDisplayTextFact) -> str | None:
+    text = fact.explicit_text
+    if text is None or not text.strip():
+        return "missing"
+    normalized = " ".join(text.casefold().split()).strip(" .:#-_[]()")
+    target = " ".join(fact.normalized_target.casefold().split()).strip(" .:#-_[]()")
+    target_type = (fact.target_type or "").casefold()
+    generic = {
+        target,
+        target_type,
+        "reference",
+        "link",
+        "this",
+        "here",
+        f"{target_type} reference",
+    }
+    if target_type == "block":
+        generic.add("paragraph")
+    return "generic" if normalized in generic else None
+
+
+def _display_source_key(
+    fact: ReferenceDisplayTextFact,
+) -> tuple[str, int, int, str]:
+    span = fact.display_text_span or fact.span
+    return (
+        fact.document_id,
+        span.start if span is not None else -1,
+        span.end if span is not None else -1,
+        fact.fact_id,
+    )

@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+import json
+from pathlib import PurePosixPath
+
+import pytest
+
+from scieqlint.diag.model import CheckResult, Diagnostic, Severity, SourceSpan
+from scieqlint.report.sarif import SarifReporter
+
+
+def test_sarif_report_has_stable_top_level_shape_and_rule_metadata() -> None:
+    payload = json.loads(SarifReporter().render(_result()))
+
+    assert payload["$schema"] == "https://json.schemastore.org/sarif-2.1.0.json"
+    assert payload["version"] == "2.1.0"
+    run = payload["runs"][0]
+    assert run["columnKind"] == "unicodeCodePoints"
+    assert run["tool"]["driver"]["name"] == "SciEqLint"
+    assert run["tool"]["driver"]["semanticVersion"] == "0.1.0"
+    assert run["tool"]["driver"]["rules"][0]["id"] == "ALG001"
+
+
+def test_sarif_report_emits_locations_and_partial_fingerprints() -> None:
+    payload = json.loads(SarifReporter().render(_result()))
+
+    sarif_result = payload["runs"][0]["results"][0]
+    assert sarif_result["ruleId"] == "ALG001"
+    assert sarif_result["level"] == "error"
+    assert sarif_result["message"]["text"] == (
+        "algebraic identity does not hold: left - right = 2*a*b"
+    )
+
+    assert sarif_result["locations"][0]["physicalLocation"] == {
+        "artifactLocation": {
+            "uri": "examples/bad/famous_bad.md",
+            "uriBaseId": "%SRCROOT%",
+        },
+        "region": {
+            "startLine": 4,
+            "startColumn": 1,
+            "endLine": 4,
+            "endColumn": 20,
+        },
+    }
+    fingerprint = sarif_result["partialFingerprints"]["primaryLocationLineHash"]
+    assert len(fingerprint) == 64
+    assert (
+        fingerprint
+        == json.loads(SarifReporter().render(_result()))["runs"][0]["results"][0][
+            "partialFingerprints"
+        ]["primaryLocationLineHash"]
+    )
+
+
+def test_sarif_report_percent_encodes_artifact_uri() -> None:
+    result = _result()
+    diagnostic = result.diagnostics[0]
+    result = CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code=diagnostic.code,
+                severity=diagnostic.severity,
+                message=diagnostic.message,
+                span=SourceSpan(
+                    path=PurePosixPath("docs/a #é.md"),
+                    start=diagnostic.span.start if diagnostic.span is not None else 0,
+                    end=diagnostic.span.end if diagnostic.span is not None else 1,
+                    line=4,
+                    col=1,
+                    end_line=4,
+                    end_col=19,
+                ),
+                equation=diagnostic.equation,
+                detail=diagnostic.detail,
+            ),
+        ),
+        files_checked=result.files_checked,
+        math_blocks_checked=result.math_blocks_checked,
+        config_path=result.config_path,
+        version=result.version,
+    )
+
+    payload = json.loads(SarifReporter().render(result))
+
+    artifact_location = payload["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+        "artifactLocation"
+    ]
+    assert artifact_location["uri"] == "docs/a%20%23%C3%A9.md"
+
+
+def test_sarif_report_uses_code_point_columns_after_non_bmp_character() -> None:
+    result = CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code="ALG001",
+                severity=Severity.ERROR,
+                message="algebraic identity does not hold",
+                span=SourceSpan(
+                    path=PurePosixPath("emoji.md"),
+                    start=1,
+                    end=2,
+                    line=1,
+                    col=2,
+                    end_line=1,
+                    end_col=2,
+                ),
+                equation="😀x = x",
+            ),
+        ),
+        files_checked=1,
+        math_blocks_checked=1,
+        config_path=None,
+        version="0.1.0",
+    )
+
+    payload = json.loads(SarifReporter().render(result))
+    run = payload["runs"][0]
+    region = run["results"][0]["locations"][0]["physicalLocation"]["region"]
+
+    assert run["columnKind"] == "unicodeCodePoints"
+    assert region["startColumn"] == 2
+    assert region["endColumn"] == 3
+
+
+def test_sarif_report_preserves_notebook_cell_location_metadata() -> None:
+    result = CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code="INP002",
+                severity=Severity.WARNING,
+                message="notebook schema issue",
+                span=SourceSpan(
+                    path=PurePosixPath("notes.ipynb"),
+                    start=0,
+                    end=0,
+                    line=1,
+                    col=1,
+                    end_line=1,
+                    end_col=1,
+                    cell=3,
+                    cell_line=1,
+                ),
+                detail="markdown cell 3 source must be a string or string list",
+            ),
+        ),
+        files_checked=1,
+        math_blocks_checked=0,
+        config_path=None,
+        version="0.1.0",
+    )
+
+    payload = json.loads(SarifReporter().render(result))
+
+    assert payload["runs"][0]["results"][0]["locations"][0]["logicalLocations"] == [
+        {
+            "fullyQualifiedName": "cell:3",
+            "kind": "module",
+        }
+    ]
+
+
+def test_sarif_report_omits_suppressed_diagnostics() -> None:
+    result = CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code="ALG001",
+                severity=Severity.ERROR,
+                message="algebraic identity does not hold",
+                span=None,
+                suppressed=True,
+            ),
+        ),
+        files_checked=1,
+        math_blocks_checked=1,
+        config_path=None,
+        version="0.1.0",
+    )
+
+    payload = json.loads(SarifReporter().render(result))
+
+    assert payload["runs"][0]["tool"]["driver"]["rules"] == []
+    assert payload["runs"][0]["results"] == []
+
+
+def test_sarif_result_limit_guard_fails_deterministically() -> None:
+    result = CheckResult(
+        diagnostics=(_diagnostic("ALG001"), _diagnostic("REF002")),
+        files_checked=1,
+        math_blocks_checked=1,
+        config_path=None,
+        version="0.1.0",
+    )
+
+    with pytest.raises(ValueError, match="SARIF result limit exceeded: 2 > 1"):
+        SarifReporter(max_results=1).render(result)
+
+
+def test_sarif_result_limit_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="max_results must be non-negative"):
+        SarifReporter(max_results=-1)
+
+
+def test_sarif_report_hides_suppressed_diagnostics() -> None:
+    result = CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code="ALG001",
+                severity=Severity.ERROR,
+                message="algebraic identity does not hold",
+                span=SourceSpan(
+                    path=PurePosixPath("paper.md"),
+                    start=0,
+                    end=1,
+                    line=1,
+                    col=1,
+                    end_line=1,
+                    end_col=1,
+                ),
+                suppressed=True,
+            ),
+        ),
+        files_checked=1,
+        math_blocks_checked=1,
+        config_path=None,
+        version="0.1.0",
+    )
+
+    payload = json.loads(SarifReporter().render(result))
+
+    assert payload["runs"][0]["results"] == []
+    assert payload["runs"][0]["tool"]["driver"]["rules"] == []
+
+
+def _result() -> CheckResult:
+    return CheckResult(
+        diagnostics=(
+            Diagnostic(
+                code="ALG001",
+                severity=Severity.ERROR,
+                message="algebraic identity does not hold",
+                span=SourceSpan(
+                    path=PurePosixPath("examples/bad/famous_bad.md"),
+                    start=3,
+                    end=21,
+                    line=4,
+                    col=1,
+                    end_line=4,
+                    end_col=19,
+                ),
+                equation="(a+b)^2 = a^2 + b^2",
+                detail="left - right = 2*a*b",
+            ),
+        ),
+        files_checked=1,
+        math_blocks_checked=1,
+        config_path=None,
+        version="0.1.0",
+    )
+
+
+def _diagnostic(code: str) -> Diagnostic:
+    return Diagnostic(
+        code=code,
+        severity=Severity.WARNING,
+        message=f"{code} message",
+        span=SourceSpan(
+            path=PurePosixPath("paper.md"),
+            start=0,
+            end=1,
+            line=1,
+            col=1,
+            end_line=1,
+            end_col=1,
+        ),
+    )

@@ -1,0 +1,514 @@
+"""LaTeX source scanner for supported math containers."""
+
+from __future__ import annotations
+
+import re
+from bisect import bisect_right
+from collections.abc import Iterable
+
+from scieqlint.config.model import Config
+from scieqlint.diag.catalog import CATALOG
+from scieqlint.diag.model import Diagnostic, SourceSpan
+from scieqlint.io.source import SourceDocument
+from scieqlint.scan.base import (
+    EquationLabel,
+    EquationReference,
+    LabelSource,
+    MathBlock,
+    MathContainer,
+    ReferenceSource,
+    ScanResult,
+    SymbolDirective,
+    SymbolDirectiveSource,
+)
+from scieqlint.scan.symbols import parse_symbol_directive
+
+ENV_RE = re.compile(r"\\begin\{(?P<name>equation\*?|align\*?)\}")
+VERBATIM_CONTROL_RE = re.compile(r"\\(?P<kind>begin|end)\{verbatim(?P<star>\*)?\}")
+LABEL_RE = re.compile(r"\\label\{(?P<label>[^{}\r\n]+)\}")
+REFERENCE_RE = re.compile(r"\\(?P<kind>eqref|ref)\{(?P<target>[^{}\r\n]+)\}")
+SYMBOL_PREFIX = "scieqlint-symbol:"
+
+
+class LatexScanner:
+    def scan(self, document: SourceDocument, config: Config) -> ScanResult:
+        _ = config
+        comments, verbatim = _lexical_ranges(document)
+        ignored = tuple(sorted((*comments, *verbatim)))
+        source_aligned_text = _source_aligned_math_text(document.text, comments)
+        blocks: list[MathBlock] = []
+        labels: list[EquationLabel] = []
+        diagnostics: list[Diagnostic] = []
+
+        blocks.extend(
+            _delimited_blocks(
+                document,
+                source_aligned_text,
+                ignored,
+                r"\[",
+                r"\]",
+                MathContainer.LATEX_DISPLAY,
+            )
+        )
+        blocks.extend(
+            _delimited_blocks(
+                document,
+                source_aligned_text,
+                ignored,
+                "$$",
+                "$$",
+                MathContainer.LATEX_DISPLAY,
+            )
+        )
+        env_blocks, env_diagnostics = _environment_blocks(document, source_aligned_text, ignored)
+        blocks.extend(env_blocks)
+        diagnostics.extend(env_diagnostics)
+        diagnostics.extend(_unterminated_delimiters(document, ignored, r"\[", r"\]"))
+        diagnostics.extend(_unterminated_delimiters(document, ignored, "$$", "$$"))
+        labels.extend(_labels(document, blocks, ignored))
+        references = tuple(_references(document, ignored))
+        symbol_directives, symbol_diagnostics = _symbol_directives(document, comments)
+        diagnostics.extend(symbol_diagnostics)
+
+        return ScanResult(
+            blocks=tuple(sorted(blocks, key=lambda block: block.span.start)),
+            labels=tuple(sorted(labels, key=lambda label: label.span.start)),
+            references=references,
+            symbol_directives=symbol_directives,
+            diagnostics=tuple(sorted(diagnostics, key=_diagnostic_key)),
+        )
+
+
+def _delimited_blocks(
+    document: SourceDocument,
+    source_aligned_text: str,
+    ignored: tuple[tuple[int, int], ...],
+    opening: str,
+    closing: str,
+    container: MathContainer,
+) -> Iterable[MathBlock]:
+    cursor = 0
+    while True:
+        start = document.text.find(opening, cursor)
+        if start == -1:
+            return
+        if _in_ranges(start, ignored):
+            cursor = start + len(opening)
+            continue
+        if _is_escaped(document.text, start):
+            cursor = start + 1
+            continue
+        body_start = start + len(opening)
+        close = _find_close(document, body_start, closing, ignored)
+        if close == -1:
+            cursor = body_start
+            continue
+        block = _math_block(document, source_aligned_text, body_start, close, container)
+        if block is not None:
+            yield block
+        cursor = close + len(closing)
+
+
+def _environment_blocks(
+    document: SourceDocument,
+    source_aligned_text: str,
+    ignored: tuple[tuple[int, int], ...],
+) -> tuple[list[MathBlock], list[Diagnostic]]:
+    blocks: list[MathBlock] = []
+    diagnostics: list[Diagnostic] = []
+    for match in ENV_RE.finditer(document.text):
+        if _in_ranges(match.start(), ignored) or _is_escaped(document.text, match.start()):
+            continue
+        name = match.group("name")
+        close_pattern = f"\\end{{{name}}}"
+        close = _find_close(document, match.end(), close_pattern, ignored)
+        if close == -1:
+            diagnostics.append(_scan_diagnostic(document, match.start(), match.end()))
+            continue
+        container = (
+            MathContainer.LATEX_ALIGN if name.startswith("align") else MathContainer.LATEX_EQUATION
+        )
+        if container is MathContainer.LATEX_ALIGN:
+            blocks.extend(_align_blocks(document, source_aligned_text, match.end(), close, ignored))
+        else:
+            block = _math_block(document, source_aligned_text, match.end(), close, container)
+            if block is not None:
+                blocks.append(block)
+    return blocks, diagnostics
+
+
+def _align_blocks(
+    document: SourceDocument,
+    source_aligned_text: str,
+    start: int,
+    end: int,
+    ignored: tuple[tuple[int, int], ...],
+) -> Iterable[MathBlock]:
+    for row_start, row_end in _align_rows(document.text, start, end, ignored):
+        aligned_row = source_aligned_text[row_start:row_end]
+        text = _clean_math_text(aligned_row).replace("&", "").strip()
+        if not text:
+            continue
+        aligned_row = "".join(
+            " " if char == "&" and not _is_escaped(aligned_row, index) else char
+            for index, char in enumerate(aligned_row)
+        )
+        span = _span(document, row_start, row_end)
+        yield MathBlock(
+            text=text,
+            source_aligned_text=aligned_row,
+            span=span,
+            block_id=_block_id(document, span, MathContainer.LATEX_ALIGN),
+            container=MathContainer.LATEX_ALIGN,
+        )
+
+
+def _align_rows(
+    text: str,
+    start: int,
+    end: int,
+    ignored: tuple[tuple[int, int], ...],
+) -> Iterable[tuple[int, int]]:
+    row_start = start
+    cursor = start
+    ignored_index = bisect_right(ignored, start, key=lambda item: item[1])
+    while cursor < end:
+        while ignored_index < len(ignored) and ignored[ignored_index][1] <= cursor:
+            ignored_index += 1
+        if ignored_index < len(ignored):
+            ignored_start, ignored_end = ignored[ignored_index]
+            if ignored_start <= cursor < ignored_end:
+                cursor = min(ignored_end, end)
+                continue
+        if text[cursor] != "\\":
+            cursor += 1
+            continue
+
+        run_end = cursor + 1
+        while run_end < end and text[run_end] == "\\":
+            run_end += 1
+        separator = cursor
+        while separator + 1 < run_end:
+            yield _trim_span(text, row_start, separator)
+            row_start = separator + 2
+            separator += 2
+        if separator == run_end:
+            row_start = _row_break_end(text, row_start, end)
+        cursor = max(run_end, row_start)
+    yield _trim_span(text, row_start, end)
+
+
+def _math_block(
+    document: SourceDocument,
+    source_aligned_text: str,
+    start: int,
+    end: int,
+    container: MathContainer,
+) -> MathBlock | None:
+    span_start, span_end = _trim_span(document.text, start, end)
+    aligned_block = source_aligned_text[span_start:span_end]
+    text = _clean_math_text(aligned_block)
+    if not text:
+        return None
+    span = _span(document, span_start, span_end)
+    return MathBlock(
+        text=text,
+        source_aligned_text=aligned_block,
+        span=span,
+        block_id=_block_id(document, span, container),
+        container=container,
+    )
+
+
+def _clean_math_text(text: str) -> str:
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines)
+
+
+def _source_aligned_math_text(
+    text: str,
+    comments: tuple[tuple[int, int], ...],
+) -> str:
+    aligned = list(text)
+    for start, end in comments:
+        for index in range(start, end):
+            if not aligned[index].isspace():
+                aligned[index] = " "
+    return "".join(aligned)
+
+
+def _labels(
+    document: SourceDocument,
+    blocks: list[MathBlock],
+    ignored: tuple[tuple[int, int], ...],
+) -> Iterable[EquationLabel]:
+    for block in blocks:
+        source_text = document.text[block.span.start : block.span.end]
+        for match in LABEL_RE.finditer(source_text):
+            if _is_escaped(source_text, match.start()):
+                continue
+            label = match.group("label")
+            if not label.strip():
+                continue
+            label_start = block.span.start + match.start("label")
+            label_end = block.span.start + match.end("label")
+            if _in_ranges(match.start() + block.span.start, ignored):
+                continue
+            yield EquationLabel(
+                label=_normalize_label(label),
+                span=_span(document, label_start, label_end),
+                block_id=block.block_id,
+                source=LabelSource.LATEX_LABEL,
+            )
+
+
+def _references(
+    document: SourceDocument,
+    ignored: tuple[tuple[int, int], ...],
+) -> Iterable[EquationReference]:
+    for match in REFERENCE_RE.finditer(document.text):
+        if _in_ranges(match.start(), ignored) or _is_escaped(document.text, match.start()):
+            continue
+        target = _normalize_label(match.group("target"))
+        if not target:
+            continue
+        source = (
+            ReferenceSource.LATEX_EQREF
+            if match.group("kind") == "eqref"
+            else ReferenceSource.LATEX_REF
+        )
+        yield EquationReference(
+            target=target,
+            span=_span(document, match.start("target"), match.end("target")),
+            raw=match.group(0),
+            source=source,
+        )
+
+
+def _symbol_directives(
+    document: SourceDocument,
+    comments: tuple[tuple[int, int], ...],
+) -> tuple[tuple[SymbolDirective, ...], tuple[Diagnostic, ...]]:
+    directives: list[SymbolDirective] = []
+    diagnostics: list[Diagnostic] = []
+    for start, line_end in comments:
+        comment = document.text[start:line_end].rstrip("\r\n")
+        comment_body = comment[1:].lstrip()
+        if not comment_body.startswith(SYMBOL_PREFIX):
+            continue
+        body_start = start + 1 + len(comment[1:]) - len(comment_body) + len(SYMBOL_PREFIX)
+        directive, diagnostic = parse_symbol_directive(
+            body=document.text[body_start:line_end],
+            raw=comment,
+            span=_span(document, start, line_end),
+            source=SymbolDirectiveSource.LATEX_COMMENT,
+            make_span=lambda span_start, span_end: _span(document, span_start, span_end),
+            body_start=body_start,
+        )
+        if directive is not None:
+            directives.append(directive)
+        if diagnostic is not None:
+            diagnostics.append(diagnostic)
+    return (
+        tuple(sorted(directives, key=lambda directive: directive.span.start)),
+        tuple(sorted(diagnostics, key=_diagnostic_key)),
+    )
+
+
+def _unterminated_delimiters(
+    document: SourceDocument,
+    ignored: tuple[tuple[int, int], ...],
+    opening: str,
+    closing: str,
+) -> Iterable[Diagnostic]:
+    closed = {
+        (start, end)
+        for start, _body_start, _body_end, end in _delimiter_ranges(
+            document,
+            ignored,
+            opening,
+            closing,
+        )
+    }
+    cursor = 0
+    while True:
+        start = document.text.find(opening, cursor)
+        if start == -1:
+            return
+        if _in_ranges(start, ignored) or any(
+            range_start <= start < range_end for range_start, range_end in closed
+        ):
+            cursor = start + len(opening)
+            continue
+        if _is_escaped(document.text, start):
+            cursor = start + 1
+            continue
+        if _find_close(document, start + len(opening), closing, ignored) == -1:
+            yield _scan_diagnostic(document, start, start + len(opening))
+        cursor = start + len(opening)
+
+
+def _delimiter_ranges(
+    document: SourceDocument,
+    ignored: tuple[tuple[int, int], ...],
+    opening: str,
+    closing: str,
+) -> Iterable[tuple[int, int, int, int]]:
+    cursor = 0
+    while True:
+        start = document.text.find(opening, cursor)
+        if start == -1:
+            return
+        if _in_ranges(start, ignored):
+            cursor = start + len(opening)
+            continue
+        if _is_escaped(document.text, start):
+            cursor = start + 1
+            continue
+        body_start = start + len(opening)
+        close = _find_close(document, body_start, closing, ignored)
+        if close == -1:
+            cursor = body_start
+            continue
+        yield start, body_start, close, close + len(closing)
+        cursor = close + len(closing)
+
+
+def _find_close(
+    document: SourceDocument,
+    start: int,
+    closing: str,
+    ignored: tuple[tuple[int, int], ...],
+) -> int:
+    cursor = start
+    while True:
+        close = document.text.find(closing, cursor)
+        if close == -1:
+            return -1
+        if _in_ranges(close, ignored):
+            cursor = close + len(closing)
+            continue
+        if _is_escaped(document.text, close):
+            cursor = close + 1
+            continue
+        return close
+
+
+def _lexical_ranges(
+    document: SourceDocument,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    comments: list[tuple[int, int]] = []
+    verbatim: list[tuple[int, int]] = []
+    text = document.text
+    index = 0
+    active_start: int | None = None
+    active_star = ""
+    while index < len(text):
+        if active_start is not None:
+            # LaTeX reads verbatim with an exact delimited terminator, so escape
+            # parity and comment syntax are not active until that terminator.
+            match = VERBATIM_CONTROL_RE.search(text, index)
+            if match is None:
+                verbatim.append((active_start, len(text)))
+                active_start = None
+                break
+            if match.group("kind") == "end" and (match.group("star") or "") == active_star:
+                verbatim.append((active_start, match.end()))
+                active_start = None
+            index = match.end()
+            continue
+        if text[index] == "%" and not _is_escaped(text, index):
+            line_end = index + 1
+            while line_end < len(text) and text[line_end] != "\n":
+                line_end += 1
+            if line_end < len(text):
+                line_end += 1
+            comments.append((index, line_end))
+            index = line_end
+            continue
+        match = VERBATIM_CONTROL_RE.match(text, index)
+        if match is not None and match.group("kind") == "begin" and not _is_escaped(text, index):
+            active_start = index
+            active_star = match.group("star") or ""
+            index = match.end()
+            continue
+        index += 1
+    if active_start is not None:
+        verbatim.append((active_start, len(text)))
+    return tuple(comments), tuple(verbatim)
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _row_break_end(text: str, start: int, end: int) -> int:
+    if start < end and text[start] == "[":
+        close = text.find("]", start + 1, end)
+        newline = text.find("\n", start, end)
+        if close != -1 and (newline == -1 or close < newline):
+            return close + 1
+    return start
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    slash_count = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        slash_count += 1
+        cursor -= 1
+    return slash_count % 2 == 1
+
+
+def _in_ranges(position: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= position < end for start, end in ranges)
+
+
+def _normalize_label(value: str) -> str:
+    value = value.strip()
+    return value[1:] if value.startswith("#") else value
+
+
+def _diagnostic_key(diagnostic: Diagnostic) -> int:
+    return diagnostic.span.start if diagnostic.span is not None else 0
+
+
+def _block_id(
+    document: SourceDocument,
+    span: SourceSpan,
+    container: MathContainer,
+) -> str:
+    return f"{document.display_path}:{span.line}:{span.col}:{container.value}"
+
+
+def _span(document: SourceDocument, start: int, end: int) -> SourceSpan:
+    line, col = document.line_index.position(start)
+    end_line, end_col = document.line_index.position(max(start, end - 1))
+    return SourceSpan(
+        path=document.path,
+        start=start,
+        end=end,
+        line=line,
+        col=col,
+        end_line=end_line,
+        end_col=end_col,
+    )
+
+
+def _scan_diagnostic(document: SourceDocument, start: int, end: int) -> Diagnostic:
+    info = CATALOG["SCAN001"]
+    return Diagnostic(
+        code=info.code,
+        severity=info.severity,
+        message=info.message,
+        span=_span(document, start, end),
+        rule="scanner",
+    )

@@ -1,0 +1,208 @@
+# Public API
+
+The stable API surface is exported from `scieqlint.api`:
+
+- `check_paths(paths, *, config_path=None, no_algebra=False, inline_math=False,
+  strict_unknowns=False, absolute_paths=False)`
+- `check_documents(documents, *, config, accessibility_metadata=None)`
+- `graph_paths(paths, *, config_path=None)`
+- `graph_documents(documents, *, config)`
+- `load_config(path=None, *, preset=None)`
+
+Public API usage:
+
+```python
+from pathlib import Path
+from scieqlint.api import (
+    check_documents,
+    check_paths,
+    graph_documents,
+    graph_paths,
+    load_config,
+)
+
+config = load_config(Path("scieqlint.toml"))
+result = check_paths([Path("README.md")], config_path=Path("scieqlint.toml"))
+graph = graph_paths([Path("README.md")], config_path=Path("scieqlint.toml"))
+print(result.exit_code())
+```
+
+API calls must not print to stdout/stderr and must not call `sys.exit`.
+`check_paths` and `graph_paths` are the path-based APIs and apply the same project
+discovery, config lookup, file ordering, ignore rules, source loading, and display
+path rules. Checks continue after a source read or decode failure and return
+`INP001`; graph construction is all-or-nothing and raises a controlled `ValueError`
+with `INP001` context chained from the original error. Baselines remain check-only.
+Explicit existing files must use a supported `.md`, `.markdown`, `.tex`, or `.ipynb`
+suffix; the path APIs raise `ValueError` for unsupported paths and the CLI reports the
+same failure with exit status 2. `DocumentKind.UNKNOWN` is rejected by the document
+APIs. Directory and glob discovery continue to ignore unsupported files.
+`check_paths` and `graph_paths` raise `FileNotFoundError` when an explicitly
+provided non-glob path does not exist. Existing paths are treated literally even
+when their names contain glob characters; only nonexistent strings with glob
+syntax are expanded.
+`check_documents` and `graph_documents` are the already-loaded-document APIs and
+do not read baseline files from disk. Path-based APIs preserve their analysis result
+when output-safety metadata is unavailable; that metadata is required only by the
+CLI guard before writing a file output.
+Both document APIs reject repeated raw paths and distinct raw paths that normalize
+to the same canonical project member; canonical member identity is owned by
+`WorkspaceHost`.
+
+`accessibility_metadata` is a caller-owned mapping from a source-owned inline-math
+accessibility ID to accessible text. IDs percent-encode the document path and trimmed
+body as `<document-path>::inline-math::<delimiter-kind>::<body>`; notebook IDs insert
+`notebook-cell::<index>` before `inline-math`. Repeated identical explicit containers
+append `::1`, `::2`, and so on. These IDs do not depend on byte offsets, while inferred
+plain-text candidates receive no ID. SciEqLint applies metadata at the orchestration
+boundary; it does not infer alternative text from surrounding prose. Keys must be
+non-empty strings and values must be strings; malformed mappings raise `ValueError`
+before analysis. Unknown or non-unique IDs are also rejected. A non-empty mapping is
+valid only with the
+`math-accessibility` profile; an empty mapping remains a no-op for compatibility.
+That profile lowers Markdown documents and notebook Markdown cells. LaTeX documents
+remain outside this contract and do not produce `PORT002` diagnostics or accessibility
+IDs.
+
+The `[project].visibility` configuration table uses each document's project-relative
+path as its key and accepts `"visible"`, `"hidden"`, or `"excluded"`. Omitted documents
+are visible, and an entry for a path not present in the analyzed project is rejected.
+Hidden and excluded equation or code-cell targets remain queryable as non-visible facts,
+while ordinary reference resolution uses visible targets only.
+
+Already-loaded callers can opt into code-cell language policy directly through the
+public config model:
+
+```python
+from scieqlint.config.model import Config, ProfileConfig, ProjectConfig
+
+config = Config(
+    profile=ProfileConfig(name="code-cell-metadata"),
+    project=ProjectConfig(code_cell_languages=("python", "julia")),
+)
+result = check_documents(documents, config=config)
+```
+
+Labeled Markdown code cells are ordinary reference targets even without this profile.
+The profile additionally admits notebook-derived cells and reports `DIR013` for malformed
+language values or values outside a nonempty project catalog. `DIR010` remains active
+for Markdown/MyST cells by default; its message covers both formats, and it is emitted
+for notebook cells when the selected profile admits notebook-derived code-cell facts.
+SciEqLint neither executes cells nor syntax-checks their contents. Profile-produced
+code-cell diagnostics retain their source span, originating fact IDs, and structured
+properties through `CheckResult`.
+
+Generated-output validation never infers a source document from a filename, input order,
+or directory layout. A caller that wants the `generated-myst` profile to compare a
+generated document with its source attaches an explicit `SourceOrigin` to that
+`SourceDocument`:
+
+```python
+from pathlib import PurePosixPath
+from scieqlint.api import check_documents
+from scieqlint.config.model import Config, ProfileConfig
+from scieqlint.io.source import DocumentKind, SourceDocument, SourceOrigin
+
+source = SourceDocument.from_text(
+    PurePosixPath("source/lecture.md"),
+    "(energy)=\n## Energy\n",
+    DocumentKind.MARKDOWN,
+)
+generated = SourceDocument.from_text(
+    PurePosixPath("translated/lecture.md"),
+    "## Energy\n",
+    DocumentKind.MARKDOWN,
+    origin=SourceOrigin(
+        source_document_id="source/lecture.md",
+        source_kind="markdown",
+        conversion_stage="translation",
+        preserved_anchor_inventory=("energy",),
+    ),
+)
+result = check_documents(
+    (source, generated),
+    config=Config(profile=ProfileConfig(name="generated-myst")),
+)
+```
+
+Programmatic provenance identifiers, source kinds, and conversion stages are
+trimmed when constructed; blank values raise `ValueError` before analysis.
+
+An absent origin means that source-to-generated identity is unknown, so the generated
+profile does not manufacture a provenance relationship.
+
+Path-based diagnostics and graph spans retain the caller-visible lexical input
+spelling. Relative inputs keep that spelling; absolute inputs are rendered
+relative to the current working directory by default. For `check_paths()`,
+`absolute_paths=True` retains an explicitly absolute input's lexical spelling
+without resolving symlinks; this presentation choice does not change
+project-relative reference resolution. `graph_paths()` always uses the default
+presentation.
+When an absolute input and the current directory have different native roots,
+default presentation raises `ValueError` rather than leak an absolute path or
+collapse distinct roots. Checks may opt into absolute paths. Graph inputs may be
+absolute when they share the current native root; graph presentation has no
+absolute-path opt-in for cross-native-root inputs.
+
+`CheckResult` exposes `diagnostics`, `files_checked`, `math_blocks_checked`,
+`config_path`, `version`, `show_suppressed`, and `exit_code()`. `exit_code()`
+returns `1` only when an unsuppressed error diagnostic exists.
+
+`Diagnostic` exposes stable diagnostic data used by reporters and JSON output:
+`code`, `severity`, `message`, `span`, `equation`, `detail`, `hint`, `rule`,
+`suppressed`, `suppression_reason`, `profile`, `provenance_ids`, and `properties`.
+`profile` is optional and identifies the validation profile that produced the
+diagnostic. `provenance_ids` contains caller-supplied provenance fact IDs and is
+empty when no provenance is available; `properties` contains string-valued rule
+metadata and is empty when no properties are present. For generated origins, one
+origin uses unprefixed property names, while multiple origins use
+`provenance_1_*`, `provenance_2_*`, and later names; missing origin fields are omitted.
+Property names are unique after projection: later rule values replace earlier values,
+and SchemaHost-owned profile and provenance values take precedence over colliding rule
+properties.
+These optional fields are omitted from JSON output when unset or empty.
+For `REF009`, the `display_text` property is the explicit Markdown/MyST label from source after
+surrounding whitespace is trimmed. Inline markup, HTML entities, and backslash escapes are kept
+as source text; the value is not renderer output.
+JSON output without projection metadata retains schema version `0.1`. If any
+emitted diagnostic contains `profile`, `provenance_ids`, or `properties`, the
+result identifies itself as `0.2` and validates against the packaged 0.2 result
+and diagnostic schemas. The 0.1 schemas remain unchanged.
+
+`SourceSpan` offsets and line/column values refer to the normalized
+`SourceDocument` text. For notebook diagnostics, the physical span is the raw
+JSON document location; `cell` identifies the zero-based notebook cell and
+`cell_line` identifies the one-based line in the decoded Markdown cell. A non-empty
+span mapped from decoded cell source also exposes `segments`, one `SourceSegment` per
+logical character covered by the span. Each segment's `ranges` contains the exact raw
+JSON range or ranges for that character, including escaped characters, normalized
+CRLF, and source-list items. A span envelope can therefore include JSON separators
+when a fact crosses source-list items; consumers that need exact source characters
+should use `segments`. Physical notebook object and metadata spans have no decoded
+source mapping and leave `segments` empty. Text, JSON, GitHub, and SARIF reporters use
+the physical span's raw JSON line and column while retaining notebook cell metadata
+where the format supports it.
+
+The opt-in `notebook-crossrefs` profile inspects only declarative code-cell and
+recorded-output metadata. Quarto `lst-label` is an alias of output `label` for
+target resolution; when both are present, `label` takes precedence. `fig-subcap`
+and `tbl-subcap` are cross-reference display options. Caption metadata also supplies
+the target type for an otherwise untyped recorded-output label. Typed labels use the
+lowercase `eq-`, `fig-`, `lst-`, or `tbl-` prefixes after an optional leading `#`.
+Each affected recorded output retains its own fact identity and exact JSON label-value
+span; notebook code is never executed or re-rendered.
+
+Notebook parsing applies fixed safety bounds at the already-loaded
+`SourceDocument` boundary: the UTF-8 byte length of normalized `SourceDocument.text`
+must be at most 1048576, and the aggregate normalized source of Markdown cells must
+be at most 100000 logical characters. These are not current configuration options;
+exceeding either bound emits `INP003`. Excessive JSON nesting emits `INP001` with a
+deterministic detail rather than escaping the parser boundary.
+
+`load_config(path, preset="generated-myst")` or
+`load_config(path, preset="mechanics")` loads packaged preset defaults before
+the user config file, so user config values override preset values. The
+`generated-myst` preset supplies the path-based generated-document validation policy,
+including source-only generated-output diagnostics. Provenance-backed checks still
+require already-loaded `SourceDocument` values with explicit `SourceOrigin` metadata;
+the path-based CLI does not manufacture that relationship.

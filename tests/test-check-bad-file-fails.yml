@@ -1,0 +1,43 @@
+name: Test check on a file with a wrong equation fails
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          # The default 1.2.1 is not published on PyPI; use the latest published release.
+          package-version: "1.1.0"
+          args: check tests/fixtures/bad/famous_bad.md
+      - name: Assert action failed due to lint findings
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: expected the lint step to fail on a bad equation"
+            exit 1
+          fi
+          if ! command -v scieqlint >/dev/null 2>&1; then
+            echo "FAIL: scieqlint not installed (failure was from install, not lint)"
+            exit 1
+          fi
+          set +e
+          OUT="$(scieqlint check tests/fixtures/bad/famous_bad.md 2>&1)"
+          STATUS=$?
+          set -e
+          echo "$OUT"
+          echo "status: $STATUS"
+          if [ "$STATUS" -ne 1 ]; then
+            echo "FAIL: expected exit status 1 (findings)"
+            exit 1
+          fi
+          if ! echo "$OUT" | grep -q "ALG001"; then
+            echo "FAIL: expected ALG001 diagnostic"
+            exit 1
+          fi
+          echo "PASS"

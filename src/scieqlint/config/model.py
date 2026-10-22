@@ -1,0 +1,170 @@
+"""Configuration data model."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+from typing import Literal, get_args
+
+DimensionMode = Literal["auto", "on", "off"]
+UnknownVariablePolicy = Literal["warn", "ignore"]
+ProjectVisibility = Literal["visible", "hidden", "excluded"]
+ValidationProfile = Literal[
+    "generated-myst",
+    "cross-format-references",
+    "math-accessibility",
+    "notebook-crossrefs",
+    "reference-display",
+    "typst-portability",
+    "code-cell-metadata",
+]
+OutputProfile = Literal["commonmark", "myst", "notebook", "typst"]
+
+_VALIDATION_PROFILE_NAMES = frozenset(get_args(ValidationProfile))
+_OUTPUT_PROFILE_NAMES = frozenset(get_args(OutputProfile))
+
+
+def _validate_choice(value: object, field_name: str, choices: frozenset[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or value not in choices:
+        formatted_choices = ", ".join(sorted(choices))
+        raise ValueError(f"{field_name} must be one of: {formatted_choices}")
+
+
+@dataclass(frozen=True, slots=True)
+class DimVector:
+    exponents: tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class VarDimension:
+    name: str
+    dimension: DimVector
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolAlias:
+    canonical: str
+    alias: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileConfig:
+    """Named validation policy selected explicitly by project configuration."""
+
+    name: ValidationProfile | None = None
+    source_kind: str | None = None
+    conversion_stage: str | None = None
+    output_profile: OutputProfile | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("source_kind", "conversion_stage"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        _validate_choice(self.name, "name", _VALIDATION_PROFILE_NAMES)
+        _validate_choice(self.output_profile, "output_profile", _OUTPUT_PROFILE_NAMES)
+        if self.name != "generated-myst" and (
+            self.source_kind is not None or self.conversion_stage is not None
+        ):
+            raise ValueError(
+                "profile.source_kind and profile.conversion_stage require "
+                'profile.name = "generated-myst"'
+            )
+        if self.name == "cross-format-references" and self.output_profile is None:
+            raise ValueError("profile.output_profile is required for cross-format-references")
+        if self.name != "cross-format-references" and self.output_profile is not None:
+            raise ValueError("profile.output_profile is only valid for cross-format-references")
+
+
+@dataclass(frozen=True, slots=True)
+class ScannerConfig:
+    markdown: bool = True
+    inline_math: bool = False
+    math_fences: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectConfig:
+    root: PurePosixPath = PurePosixPath(".")
+    order: tuple[str, ...] = ()
+    visibility: tuple[tuple[str, ProjectVisibility], ...] = ()
+    code_cell_languages: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineConfig:
+    files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AlgebraConfig:
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ParserConfig:
+    strict_unknowns: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencesConfig:
+    enabled: bool = True
+    missing_label_strict: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DimensionConfig:
+    mode: DimensionMode = "auto"
+    unknown_variables: UnknownVariablePolicy = "warn"
+
+    def is_active(self, *, has_vars: bool) -> bool:
+        if self.mode == "off":
+            return False
+        if self.mode == "on":
+            return True
+        return has_vars
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolsConfig:
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ChecksConfig:
+    algebra: AlgebraConfig = field(default_factory=AlgebraConfig)
+    references: ReferencesConfig = field(default_factory=ReferencesConfig)
+    dimension: DimensionConfig = field(default_factory=DimensionConfig)
+    symbols: SymbolsConfig = field(default_factory=SymbolsConfig)
+
+
+@dataclass(frozen=True, slots=True)
+class IgnoreConfig:
+    files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReportConfig:
+    show_suppressed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    """Config model for the first supported Markdown/MyST checks."""
+
+    path: PurePosixPath | None = None
+    project: ProjectConfig = field(default_factory=ProjectConfig)
+    baseline: BaselineConfig = field(default_factory=BaselineConfig)
+    scanner: ScannerConfig = field(default_factory=ScannerConfig)
+    parser: ParserConfig = field(default_factory=ParserConfig)
+    checks: ChecksConfig = field(default_factory=ChecksConfig)
+    vars: tuple[VarDimension, ...] = ()
+    aliases: tuple[SymbolAlias, ...] = ()
+    ignore: IgnoreConfig = field(default_factory=IgnoreConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
