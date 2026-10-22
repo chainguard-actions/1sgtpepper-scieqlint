@@ -9,6 +9,7 @@ Hardened by [Chainguard](https://www.chainguard.dev) from the upstream action at
 | Version | Tag | Upstream commit |
 |---------|-----|-----------------|
 | v1.1.0 | [`v1.1.0`](https://github.com/chainguard-actions/1sgtpepper-scieqlint/tree/v1.1.0) | [`3996a6c`](https://github.com/1sgtpepper/scieqlint/commit/3996a6cf508e175bead3f325b3ce4ec637e612d1) |
+| v1.2.1 | [`v1.2.1`](https://github.com/chainguard-actions/1sgtpepper-scieqlint/tree/v1.2.1) | [`1e1267d`](https://github.com/1sgtpepper/scieqlint/commit/1e1267da22ffebd5348b2bcfdb32703a7c6ea193) |
 
 ## Privacy
 
