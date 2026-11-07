@@ -42,8 +42,8 @@ runs:
     - name: Install SciEqLint
       shell: bash
       env:
-        INPUT_PACKAGE_VERSION: ${{ inputs.package-version }}
-      run: python -m pip install "scieqlint==$INPUT_PACKAGE_VERSION"
+        PACKAGE_VERSION: ${{ inputs.package-version }}
+      run: python -m pip install "scieqlint==${PACKAGE_VERSION}"
     - name: Run SciEqLint
       shell: bash
       env:
@@ -51,8 +51,8 @@ runs:
       run: |
         args=()
         if [ -n "$INPUT_ARGS" ]; then
-          printf '%s' "$INPUT_ARGS" | xargs -r true   # fails on an unmatched quote
+          printf '%s' "$INPUT_ARGS" | xargs -r true >/dev/null
           while IFS= read -r -d '' t; do args+=("$t"); done \
-            < <(printf '%s' "$INPUT_ARGS" | xargs -r printf '%s\0')
+            < <(printf '%s' "$INPUT_ARGS" | xargs -r sh -c 'printf "%s\0" "$@"' sh)
         fi
         scieqlint "${args[@]}"

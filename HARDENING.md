@@ -16,7 +16,7 @@ Action **1sgtpepper--scieqlint/v1.2.1** was hardened automatically. 5 finding(s)
 
 ### unpinned-uses (severity: high)
 
-action.yml pins a composite step to a tag, not a 40-character commit SHA: `uses: actions/setup-python@v7`.
+action.yml points to an action by a mutable tag instead of a full 40-character commit SHA: `uses: actions/setup-python@v7`.
 
 Locations:
 
@@ -24,7 +24,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Sub-rule (a): an expression is placed straight into a run: script: `run: python -m pip install "scieqlint==${{ inputs.package-version }}"`. A crafted package-version value can break out of the quotes and run arbitrary commands. Pass it through an env: variable and quote it in the script.
+Sub-rule (a): an expression is placed directly inside a run: script in the 'Install SciEqLint' step: `run: python -m pip install "scieqlint==${{ inputs.package-version }}"`. Fix: pass the input through env: (for example PACKAGE_VERSION) and reference it as "$PACKAGE_VERSION".
 
 Locations:
 
@@ -32,7 +32,7 @@ Locations:
 
 ### script-injection (severity: high)
 
-Sub-rule (a): an expression is placed straight into a run: script: `run: scieqlint ${{ inputs.args }}`. A caller-supplied args value is pasted in as shell text, so metacharacters such as ;, |, $() and backticks would run. Pass it through an env: variable and expand it in a controlled way, for example by reading it into a bash array, instead of templating it into the script.
+Sub-rule (a): an expression is placed directly inside a run: script in the 'Run SciEqLint' step: `run: scieqlint ${{ inputs.args }}`. The shell runs the input as written, so metacharacters like ; | $( ) in it become commands. Fix: pass it through an env var and split it safely, for example by reading it into a bash array with `read -ra`, rather than putting it into the script as a template.
 
 Locations:
 
@@ -62,5 +62,5 @@ Locations:
 
 **Notes:**
 
-Pinned actions/setup-python to 6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 (v7). Moved inputs.package-version into an env var, quoted in the pip command. Moved inputs.args into env and split it into a bash array with the quote-aware xargs method, which matches how the shell split the inline expression before (with an empty-value guard and an unmatched-quote check).
+Pinned actions/setup-python to 6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 (v7). Moved inputs.package-version into env PACKAGE_VERSION. Moved inputs.args into env INPUT_ARGS and tokenized it with a quote-aware xargs split into a bash array (matching upstream's inline-expression semantics), guarded for empty values and unmatched quotes.
 
